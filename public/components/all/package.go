@@ -34,6 +34,7 @@ import (
 	_ "github.com/benthosdev/benthos/v4/public/components/pure"
 	_ "github.com/benthosdev/benthos/v4/public/components/pure/extended"
 	_ "github.com/benthosdev/benthos/v4/public/components/pusher"
+	_ "github.com/benthosdev/benthos/v4/public/components/rabbitmq"
 	_ "github.com/benthosdev/benthos/v4/public/components/redis"
 	_ "github.com/benthosdev/benthos/v4/public/components/sftp"
 	_ "github.com/benthosdev/benthos/v4/public/components/snowflake"

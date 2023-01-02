@@ -3,104 +3,160 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/amqp"
-	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/stream"
 
+	"github.com/benthosdev/benthos/v4/internal/checkpoint"
 	"github.com/benthosdev/benthos/v4/public/service"
 )
 
 func init() {
 	err := service.RegisterInput(
-		"rabbitmqstreams", commonInputConfig("Reads messages from a RabbitMQ stream protocol."),
+		"rabbitmqstreams", consumerInputConfig(commonInputConfig("Write messages to a RabbitMQ stream.")),
 		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
-			return newRabbitMQStreamsReaderFromConfig(conf, mgr.Logger())
+			input, err := streamInputFromConfig(conf, mgr.Logger())
+			if err != nil {
+				return nil, err
+			}
+			return service.AutoRetryNacks(input), nil
 		})
 	if err != nil {
 		panic(err)
 	}
 }
 
-type rabbitMQStreamsReader struct {
-	env      *stream.Environment
-	consumer *stream.Consumer
+type streamsReader struct {
+	commonParams   commonParams
+	consumerParams consumerParams
 
-	params commonParams
-	log    *service.Logger
+	consumer *pausableConsumer
+	log      *service.Logger
 
-	messages chan *amqp.Message
+	checkpoint         *checkpoint.Type
+	messages           chan *inFlightMessage
+	backgroundQuitChan chan bool
 }
 
-func newRabbitMQStreamsReaderFromConfig(conf *service.ParsedConfig, log *service.Logger) (*rabbitMQStreamsReader, error) {
-	params, err := commonParamsFromConfig(conf)
+func streamInputFromConfig(conf *service.ParsedConfig, log *service.Logger) (*streamsReader, error) {
+	commonParams, err := commonParamsFromConfig(conf)
 	if err != nil {
 		return nil, fmt.Errorf("Failed parsing RabbitMQ streams config: %w", err)
 	}
-	bs := rabbitMQStreamsReader{
-		log:    log,
-		params: params,
-
-		messages: make(chan *amqp.Message),
+	consumerParams, err := consumerParamsFromConfig(conf)
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing RabbitMQ streams config: %w", err)
 	}
-	return &bs, nil
+
+	bs := &streamsReader{
+		log:            log,
+		commonParams:   commonParams,
+		consumerParams: consumerParams,
+		messages:       make(chan *inFlightMessage),
+		checkpoint:     checkpoint.New(),
+	}
+
+	return bs, nil
 }
 
-func (bs *rabbitMQStreamsReader) Connect(ctx context.Context) error {
-	opts := stream.NewEnvironmentOptions()
-	if err := configureConnectionParameters(opts, bs.params.dsns); err != nil {
-		return err
-	}
-	env, err := stream.NewEnvironment(opts)
+func (bs *streamsReader) Connect(ctx context.Context) error {
+	var err error
+	bs.consumer, err = newPausableConsumerFromConfig(
+		bs.commonParams,
+		bs.consumerParams,
+		func(offset int64, message *amqp.Message) {
+			onAck := bs.checkpoint.Track(offset, 1)
+			if bs.tooManyInFlightMessages() {
+				err := bs.consumer.pause()
+				if err != nil && err != errConsumerPaused {
+					bs.log.Warnf("Failed to pause consumer: %", err)
+				} else if err == nil {
+					bs.log.Info("Paused the consumer")
+				}
+			}
+
+			bs.messages <- &inFlightMessage{
+				amqpMsg: message,
+				onAck:   onAck,
+			}
+		}, func() int64 {
+			highest := bs.checkpoint.Highest()
+			highestConverted, ok := highest.(int64)
+			if ok {
+				return highestConverted + 1
+			}
+			return 0
+		},
+		bs.log,
+	)
 	if err != nil {
 		return err
 	}
 
-	if bs.params.declareEnabled {
-		opts := &stream.StreamOptions{}
-		if bs.params.declareCapacityGb != 0 {
-			opts.SetMaxLengthBytes(stream.ByteCapacity{}.GB(int64(bs.params.declareCapacityGb)))
-		} else if bs.params.declareCapacityMb != 0 {
-			opts.SetMaxLengthBytes(stream.ByteCapacity{}.MB(int64(bs.params.declareCapacityMb)))
-		}
-		if bs.params.declareMaxAge > 0 {
-			opts.SetMaxAge(bs.params.declareMaxAge)
-		}
-		err = env.DeclareStream(
-			bs.params.streamName,
-			opts,
-		)
-		if err != nil {
-			return fmt.Errorf("Failed to declare RabbitMQ Stream: %w", err)
-		}
-	}
+	go bs.startBackgroundTasks()
 
-	bs.env = env
-
-	bs.consumer, err = env.NewConsumer(bs.params.streamName, func(consumerContext stream.ConsumerContext, message *amqp.Message) {
-		bs.messages <- message
-	}, nil)
-
-	if err != nil {
-		return nil
-	}
 	return nil
 }
 
-func (bs *rabbitMQStreamsReader) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
-	msg := service.NewMessage((<-bs.messages).GetData())
-	return msg, func(ctx context.Context, res error) error {
-		return bs.consumer.StoreOffset()
-	}, nil
+func (bs *streamsReader) startBackgroundTasks() {
+	bs.backgroundQuitChan = make(chan bool)
+	offsetFlushTicker := time.NewTicker(bs.consumerParams.offsetFlushInterval)
+	wakeConsumerTicker := time.NewTicker(1 * time.Millisecond)
+
+	for {
+		select {
+		case <-offsetFlushTicker.C:
+			highest := bs.checkpoint.Highest()
+			highestConverted, ok := highest.(int64)
+
+			if ok && highestConverted > 0 {
+				err := bs.consumer.setOffset(highestConverted + 1)
+				if err != nil && err != errConsumerPaused {
+					bs.log.Warnf("Failed to store offset: %s", err)
+				}
+			}
+		case <-wakeConsumerTicker.C:
+			if !bs.tooManyInFlightMessages() {
+				err := bs.consumer.start()
+				if err != nil && err != errConsumerAlreadyRunning {
+					bs.log.Warnf("Failed to start consumer: %s", err)
+				} else if err == nil {
+					bs.log.Info("Started the conusmer")
+				}
+			}
+		case <-bs.backgroundQuitChan:
+			return
+		}
+	}
 }
 
-func (bs *rabbitMQStreamsReader) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
-
-	return nil, func(ctx context.Context, err error) error {
-		return nil
-	}, nil
+func (bs *streamsReader) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
+	select {
+	case inFlightMsg := <-bs.messages:
+		msg := service.NewMessage(inFlightMsg.amqpMsg.GetData())
+		return msg, func(ctx context.Context, outputErr error) error {
+			if outputErr == nil {
+				inFlightMsg.onAck()
+			}
+			return outputErr
+		}, nil
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
 }
 
-func (bs *rabbitMQStreamsReader) Close(ctx context.Context) (err error) {
+func (bs *streamsReader) Close(ctx context.Context) (err error) {
 	close(bs.messages)
-	return bs.env.Close()
+	bs.backgroundQuitChan <- true
+	bs.backgroundQuitChan = nil
+	return bs.consumer.close()
+}
+
+func (bs *streamsReader) tooManyInFlightMessages() bool {
+	return bs.checkpoint.Pending() > int64(bs.consumerParams.checkpointLimit)
+}
+
+type inFlightMessage struct {
+	amqpMsg *amqp.Message
+	onAck   func() any
 }

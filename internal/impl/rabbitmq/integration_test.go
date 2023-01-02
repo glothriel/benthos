@@ -1,5 +1,6 @@
 package rabbitmq
 
+// TODO: This whole file is a dumb copy of template from beanstalk, tests must be added
 import (
 	"testing"
 	"time"

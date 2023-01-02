@@ -3,115 +3,63 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"time"
 
 	"github.com/benthosdev/benthos/v4/public/service"
 
 	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/ha"
+	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/message"
 
 	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/amqp"
-	stream_message "github.com/rabbitmq/rabbitmq-stream-go-client/pkg/message"
 	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/stream"
 )
 
-func rabbitMQStreamsOutputConfig() *service.ConfigSpec {
-	return service.NewConfigSpec().
-		Categories("Services").
-		Version("4.7.0").
-		Summary("Write messages to a RabbitMQ stream.").
-		Field(service.NewStringListField("dsns")).Description("A list of uris (can be one)").Example("", "", "").
-		Field(service.NewObjectField(
-			"stream",
-			service.NewStringField("name"),
-			service.NewObjectField(
-				"declare",
-				service.NewBoolField("enabled"),
-				service.NewObjectField(
-					"max_age",
-					service.NewIntField("seconds").Default(0),
-					service.NewIntField("hours").Default(0),
-					service.NewIntField("days").Default(0),
-				),
-				service.NewObjectField(
-					"capacity",
-					service.NewIntField("megabytes").Default(0),
-					service.NewIntField("gigabytes").Default(0),
-				),
-			),
-		)).Description("A list of hosts (can be one)").Example("", "", "")
-	// Field(service.NewStringField("address").
-	// 	Description("An address to connect to.").
-	// 	Example("127.0.0.1:11300")).
-	// Field(service.NewIntField("max_in_flight").
-	// 	Description("The maximum number of messages to have in flight at a given time. Increase to improve throughput.").
-	// 	Default(64))
-}
-
 func init() {
-	err := service.RegisterOutput(
-		"rabbitmqstreams", rabbitMQStreamsOutputConfig(),
-		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Output, int, error) {
-			w, err := newRabbitMQStreamsWriterFromConfig(conf, mgr.Logger())
-			return w, 1000, err
+	err := service.RegisterBatchOutput(
+		"rabbitmqstreams",
+		commonInputConfig("Write messages to a RabbitMQ stream.").
+			Field(service.NewBatchPolicyField("batching")),
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.BatchOutput, service.BatchPolicy, int, error) {
+			w, err := newStreamOutputFromConfig(conf, mgr.Logger())
+			if err != nil {
+				return w, service.BatchPolicy{}, 1, err
+			}
+			batchPolicy, err := conf.FieldBatchPolicy("batching")
+			// max_in_flight == 1, client locks a mutex every time BatchSend is called
+			return w, batchPolicy, 1, err
 		})
 	if err != nil {
 		panic(err)
 	}
 }
 
-type rabbitMQStreamsWriter struct {
-	env      *stream.Environment
+type streamOutput struct {
 	producer *ha.ReliableProducer
 
 	params commonParams
 	log    *service.Logger
 }
 
-func newRabbitMQStreamsWriterFromConfig(conf *service.ParsedConfig, log *service.Logger) (*rabbitMQStreamsWriter, error) {
+func newStreamOutputFromConfig(conf *service.ParsedConfig, log *service.Logger) (*streamOutput, error) {
 	params, err := commonParamsFromConfig(conf)
 	if err != nil {
 		return nil, fmt.Errorf("Failed parsing RabbitMQ streams config: %w", err)
 	}
-	bs := rabbitMQStreamsWriter{
+	bs := streamOutput{
 		log:    log,
 		params: params,
 	}
 	return &bs, nil
 }
 
-func (bs *rabbitMQStreamsWriter) Connect(ctx context.Context) error {
-	opts := stream.NewEnvironmentOptions()
-	if err := configureConnectionParameters(opts, bs.params.dsns); err != nil {
-		return err
-	}
-	env, err := stream.NewEnvironment(opts)
+func (bs *streamOutput) Connect(ctx context.Context) error {
+	env, err := prepareStreamEnvironment(bs.params)
 	if err != nil {
 		return err
 	}
-
-	if bs.params.declareEnabled {
-		opts := &stream.StreamOptions{}
-		if bs.params.declareCapacityGb != 0 {
-			opts.SetMaxLengthBytes(stream.ByteCapacity{}.GB(int64(bs.params.declareCapacityGb)))
-		} else if bs.params.declareCapacityMb != 0 {
-			opts.SetMaxLengthBytes(stream.ByteCapacity{}.MB(int64(bs.params.declareCapacityMb)))
-		}
-		if bs.params.declareMaxAge > 0 {
-			opts.SetMaxAge(bs.params.declareMaxAge)
-		}
-		err = env.DeclareStream(bs.params.streamName,
-			opts,
-		)
-		if err != nil {
-			return fmt.Errorf("Failed to declare RabbitMQ Stream: %w", err)
-		}
-	}
-
-	bs.env = env
-
 	bs.producer, err = ha.NewHAProducer(env, bs.params.streamName, nil, func(messageConfirm []*stream.ConfirmationStatus) {
-		for _, m := range messageConfirm {
-			bs.log.Info(fmt.Sprintf("%v", m.IsConfirmed()))
-		}
+		// TODO: Ensure, that in case of BatchSend confirmations don't need to be tracked
 	})
 
 	if err != nil {
@@ -120,16 +68,47 @@ func (bs *rabbitMQStreamsWriter) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (bs *rabbitMQStreamsWriter) Write(ctx context.Context, msg *service.Message) error {
-	defer func() { bs.log.Warn("ueue") }()
-	messageBytes, err := msg.AsBytes()
+func (bs *streamOutput) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
+	bs.log.Infof("[out] Writing batch size: %d", len(batch))
+	rabbitmMQBatch := []message.StreamMessage{}
+	for _, msg := range batch {
+		messageBytes, err := msg.AsBytes()
+		if err != nil {
+			return err
+		}
+		rabbitmMQBatch = append(rabbitmMQBatch, amqp.NewMessage(messageBytes))
+	}
+	err := bs.producer.BatchSend(rabbitmMQBatch)
 	if err != nil {
 		return err
 	}
-
-	return bs.producer.BatchSend([]stream_message.StreamMessage{amqp.NewMessage(messageBytes)})
+	// if !BG().Bool() {
+	// 	return fmt.Errorf("Mock error!")
+	// }
+	return nil
 }
 
-func (bs *rabbitMQStreamsWriter) Close(context.Context) error {
-	return bs.env.Close()
+func (bs *streamOutput) Close(context.Context) error {
+	return bs.producer.Close()
+}
+
+type boolgen struct {
+	src       rand.Source
+	cache     int64
+	remaining int
+}
+
+func (b *boolgen) Bool() bool {
+	if b.remaining == 0 {
+		b.cache, b.remaining = b.src.Int63(), 63
+	}
+
+	result := b.cache&0x01 == 1
+	b.cache >>= 1
+	b.remaining--
+
+	return result
+}
+func BG() *boolgen {
+	return &boolgen{src: rand.NewSource(time.Now().UnixNano())}
 }

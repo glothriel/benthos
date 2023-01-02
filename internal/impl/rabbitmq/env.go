@@ -38,11 +38,12 @@ func configureConnectionParameters(
 	return errors.New("You need to configure at least one RabbitMQ stream address")
 }
 
-func configureStreamsEnv(params commonParams) (*stream.Environment, error) {
+func prepareStreamEnvironment(params commonParams) (*stream.Environment, error) {
 	opts := stream.NewEnvironmentOptions()
 	if err := configureConnectionParameters(opts, params.dsns); err != nil {
 		return nil, err
 	}
+
 	env, err := stream.NewEnvironment(opts)
 	if err != nil {
 		return nil, err

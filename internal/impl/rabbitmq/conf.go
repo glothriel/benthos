@@ -115,3 +115,41 @@ func validateAtMostOneBiggerThanZero(values []int) bool {
 	}
 	return true
 }
+
+func consumerInputConfig(spec *service.ConfigSpec) *service.ConfigSpec {
+	return spec.Field(
+		service.NewDurationField("offset_flush_interval").
+			Default("100ms"),
+	).Field(
+		service.NewIntField("checkpoint_limit").
+			Description("Determines how many messages can be processed in parallel before applying back pressure.").
+			Default(1024).
+			Advanced(),
+	).Field(
+		service.NewStringField("consumer"),
+	)
+}
+
+type consumerParams struct {
+	consumerName        string
+	offsetFlushInterval time.Duration
+	checkpointLimit     int
+}
+
+func consumerParamsFromConfig(conf *service.ParsedConfig) (consumerParams, error) {
+	var params consumerParams
+	var err error
+	params.consumerName, err = conf.FieldString("consumer")
+	if err != nil {
+		return params, err
+	}
+	params.offsetFlushInterval, err = conf.FieldDuration("offset_flush_interval")
+	if err != nil {
+		return params, err
+	}
+	params.checkpointLimit, err = conf.FieldInt("checkpoint_limit")
+	if err != nil {
+		return params, err
+	}
+	return params, nil
+}
